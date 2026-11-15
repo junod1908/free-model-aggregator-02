@@ -12,7 +12,12 @@ answer back into the client's wire. A gateway refusal (429/5xx) is never the
 answer: the request retries once on the same model when it still out-rates
 the next candidate, else fails over to the next candidate, and every refusal
 that precedes a served answer is reported in the
-x-makefun-upstream-failures header so the failover column can see it.
+x-makefun-upstream-failures header so the failover column can see it. An
+answer that arrives empty or cut off by its token limit is likewise retried
+once on the same model when it still out-rates the next candidate — a spent
+token budget is not a refusal to comply — while a model a 429 cooled on the
+previous prompt bids only slightly less on the next one, never a whole tier
+less, so one rate-limit burst cannot hand a run of prompts to weaker models.
 
 Every routing choice is a function of the brief, the requests and the
 gateway's answers seen so far: no wall clock and no randomness anywhere, so
@@ -42,6 +47,11 @@ POLL_SECONDS = 0.1
 # Live egress: one gateway, one route, one global call budget per trial.
 MAX_ATTEMPTS = 4
 MAX_CALLS_PER_TRIAL = 60
+# A model a 429 cooled on the previous prompt keeps its place in the order
+# but bids this many rating points less on the next one: enough to drop it
+# behind its equals, far too little to hand a whole tier to the next model
+# down (the tier gaps that matter are 93 and 172 points).
+COOLDOWN_PENALTY_MILLI = 40
 MAX_TOKENS_DEFAULT = 512
 MAX_TOKENS_CAP = 8192
 MAX_TRAIL_ROWS = 8
@@ -628,16 +638,26 @@ class Router:
     # -- candidates ------------------------------------------------------
 
     def candidates(self, requires):
-        """Every free model that may serve, best first: highest rating,
-        then the brief's order, then the model id — with models cooled by
-        a 429 on the previous prompt dropped one step behind the rest."""
+        """Every free model that may serve, best first: highest effective
+        rating, then the brief's order, then the model id. A model cooled
+        by a 429 on the previous prompt bids COOLDOWN_PENALTY_MILLI points
+        less — one step behind its equals, but never a whole tier down:
+        demoting it behind every other model would hand the prompt to a
+        lower tier for certain, while a fresh attempt on it costs only a
+        refused call when it is still limited."""
         found = [
             row for row in self.brief.models
             if row.get("free") is True and meets_requirements(row, requires)
         ]
+
+        def effective(row):
+            rating = row.get("rating_milli", 0)
+            if row["id"] in self.cooled:
+                rating -= COOLDOWN_PENALTY_MILLI
+            return rating
+
         found.sort(key=lambda r: (
-            0 if r["id"] not in self.cooled else 1,
-            -r.get("rating_milli", 0),
+            -effective(r),
             self.order[r["id"]],
             r["id"],
         ))
@@ -679,6 +699,7 @@ class Router:
         queue = self.candidates(requires)
         tried = set()
         retried = set()  # models already given their one retry, this request
+        retried_unusable = set()  # models retried after a truncated answer
         trail = []
         attempts = 0
         while attempts < MAX_ATTEMPTS and self.calls < MAX_CALLS_PER_TRIAL:
@@ -694,12 +715,31 @@ class Router:
             ok, answer, refusal = self.call_gateway(model, canon)
             attempts += 1
             if ok:
-                if self._usable(answer, token, queue, tried):
+                if self._usable(answer, token):
                     # A refusal this model recovered from in the same
                     # prompt was transient: do not cool it for the next
                     # prompt — it just proved it can serve.
                     self.last_429.discard(model)
                     return (model, answer), trail
+                if (self._truncated(answer)
+                        and model not in retried_unusable
+                        and attempts < MAX_ATTEMPTS
+                        and self.calls < MAX_CALLS_PER_TRIAL):
+                    # An empty or length-cut answer is a spent token
+                    # budget, not a refusal to comply: it may well answer
+                    # in full on a second call. Buy the rating back with
+                    # one same-model retry when this pick still out-rates
+                    # whatever would serve instead; a non-empty answer
+                    # that merely ignores the prompt is likelier stable,
+                    # so it fails over at once as before.
+                    nxt = None
+                    for row in queue:
+                        if row["id"] not in tried and row["id"] != model:
+                            nxt = row
+                            break
+                    if nxt is None or rating > nxt.get("rating_milli", 0):
+                        retried_unusable.add(model)
+                        continue  # not in tried, so the pick loop re-picks it
                 tried.add(model)
                 continue
             status, code = refusal
@@ -726,7 +766,7 @@ class Router:
                         ok, answer, refusal = self.call_gateway(model, canon)
                         attempts += 1
                         if ok:
-                            if self._usable(answer, token, queue, tried):
+                            if self._usable(answer, token):
                                 self.last_429.discard(model)
                                 return (model, answer), trail
                             tried.add(model)
@@ -744,17 +784,28 @@ class Router:
             # invalid; do not spend more calls the same way on this model.
         return None, trail
 
-    def _usable(self, answer, token, queue, tried):
-        """A 2xx answer may serve the prompt: its text carries the token,
-        and it made no tool call while an untried candidate remains."""
-        text, _tin, _tout, _stop, has_tools = answer
+    def _usable(self, answer, token):
+        """A 2xx answer may serve the prompt: its text carries the token.
+        Tool calls riding along do not disqualify it when the answer
+        still finished as text — the served answer is that text, exactly
+        as it would be without them, and discarding it would only hand
+        the prompt to a lower-rated model. A genuine tool-call finish
+        (tool-family stop reason) is not a text answer and keeps failing
+        over, as does an answer with no text at all: neither proves the
+        prompt was answered."""
+        text, _tin, _tout, stop, has_tools = answer
         if token is not None and token not in text:
             return False
-        if has_tools:
-            for row in queue:
-                if row["id"] not in tried:
-                    return False
+        if has_tools and (text == "" or STOP_FAMILY.get(stop) == 2):
+            return False
         return True
+
+    @staticmethod
+    def _truncated(answer):
+        """The answer ran out of room rather than out of compliance: no
+        text at all, or a length-family stop reason."""
+        text, _tin, _tout, stop, _tools = answer
+        return text == "" or STOP_FAMILY.get(stop) == 1
 
     def end_prompt(self):
         """Roll the 429 set forward: what cooled down on this prompt drops
